@@ -1,0 +1,208 @@
+// Source code is decompiled from a .class file using FernFlower decompiler (from Intellij IDEA).
+package com.caterer.chatbot;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.Executor;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class ChatServer {
+   private static final int PORT = 8080;
+   private static NLPClassifier classifier;
+   private static ResponseDatabase db;
+
+   public ChatServer() {
+   }
+
+   public static void main(String[] var0) {
+      try {
+         System.out.println("\ud83e\udd16 Initializing Omkar Vivah Chatbot Backend...");
+         db = new ResponseDatabase();
+         classifier = new NLPClassifier();
+         System.out.println("\ud83d\udcd6 Loading training database...");
+         db.populateTrainingData(classifier);
+         System.out.println("\ud83e\udde0 Training NLP Cosine-Similarity classifier...");
+         classifier.train();
+         System.out.printf("   - Trained on %d phrases\n", classifier.getTrainingSize());
+         System.out.printf("   - Vocabulary size: %d words\n", classifier.getVocabulary().size());
+         HttpServer var1 = HttpServer.create(new InetSocketAddress(8080), 0);
+         var1.createContext("/api/chat", new ChatHandler());
+         var1.createContext("/api/status", new StatusHandler());
+         var1.createContext("/api/train", new TrainHandler());
+         var1.setExecutor((Executor)null);
+         var1.start();
+         System.out.println("\ud83d\ude80 ChatServer is running!");
+         System.out.println("\ud83d\udd0c API Endpoint: http://localhost:8080/api/chat");
+         System.out.println("\ud83d\udd0c Status Endpoint: http://localhost:8080/api/status");
+         System.out.println("\ud83d\udca1 Press Ctrl+C to terminate the server.");
+      } catch (Exception var2) {
+         System.err.println("❌ Failed to start ChatServer: " + var2.getMessage());
+         var2.printStackTrace();
+      }
+
+   }
+
+   private static void setStandardHeaders(HttpExchange var0) {
+      var0.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+      var0.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+      var0.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+      var0.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+   }
+
+   private static boolean handlePreflight(HttpExchange var0) throws IOException {
+      if ("OPTIONS".equalsIgnoreCase(var0.getRequestMethod())) {
+         setStandardHeaders(var0);
+         var0.sendResponseHeaders(204, -1L);
+         return true;
+      } else {
+         return false;
+      }
+   }
+
+   private static String readStream(InputStream var0) throws IOException {
+      StringBuilder var1 = new StringBuilder();
+      BufferedReader var2 = new BufferedReader(new InputStreamReader(var0, StandardCharsets.UTF_8));
+
+      String var3;
+      try {
+         while((var3 = var2.readLine()) != null) {
+            var1.append(var3);
+         }
+      } catch (Throwable var6) {
+         try {
+            var2.close();
+         } catch (Throwable var5) {
+            var6.addSuppressed(var5);
+         }
+
+         throw var6;
+      }
+
+      var2.close();
+      return var1.toString();
+   }
+
+   private static String parseMessageFromJson(String var0) {
+      if (var0 != null && !var0.isEmpty()) {
+         Pattern var1 = Pattern.compile("\"message\"\\s*:\\s*\"([^\"]+)\"");
+         Matcher var2 = var1.matcher(var0);
+         return var2.find() ? decodeJsonString(var2.group(1)) : "";
+      } else {
+         return "";
+      }
+   }
+
+   private static String decodeJsonString(String var0) {
+      return var0.replace("\\\"", "\"").replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\");
+   }
+
+   private static String escapeJsonString(String var0) {
+      return var0 == null ? "" : var0.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+   }
+
+   private static void sendError(HttpExchange var0, int var1, String var2) throws IOException {
+      String var3 = String.format("{\"error\":\"%s\"}", escapeJsonString(var2));
+      byte[] var4 = var3.getBytes(StandardCharsets.UTF_8);
+      var0.sendResponseHeaders(var1, (long)var4.length);
+      OutputStream var5 = var0.getResponseBody();
+      var5.write(var4);
+      var5.close();
+   }
+
+   private static class ChatHandler implements HttpHandler {
+      private ChatHandler() {
+      }
+
+      public void handle(HttpExchange var1) throws IOException {
+         if (!ChatServer.handlePreflight(var1)) {
+            ChatServer.setStandardHeaders(var1);
+            if (!"POST".equalsIgnoreCase(var1.getRequestMethod())) {
+               ChatServer.sendError(var1, 405, "Method Not Allowed. Use POST.");
+            } else {
+               try {
+                  InputStream var2 = var1.getRequestBody();
+                  String var3 = ChatServer.readStream(var2);
+                  String var4 = ChatServer.parseMessageFromJson(var3);
+                  if (var4.isEmpty()) {
+                     ChatServer.sendError(var1, 400, "Bad Request: JSON body must contain a non-empty 'message' field.");
+                     return;
+                  }
+
+                  System.out.println("\ud83d\udce5 Received query: \"" + var4 + "\"");
+                  NLPClassifier.ClassificationResult var5 = ChatServer.classifier.classify(var4);
+                  String var6 = ChatServer.db.getResponse(var5.intent, var4);
+                  String var10001 = var5.intent;
+                  System.out.println("\ud83d\udce4 Matched intent: [" + var10001 + "] (Conf: " + String.format("%.2f", var5.confidence) + ")");
+                  String var7 = String.format("{\"response\":\"%s\",\"intent\":\"%s\",\"confidence\":%.4f}", ChatServer.escapeJsonString(var6), var5.intent, var5.confidence);
+                  byte[] var8 = var7.getBytes(StandardCharsets.UTF_8);
+                  var1.sendResponseHeaders(200, (long)var8.length);
+                  OutputStream var9 = var1.getResponseBody();
+                  var9.write(var8);
+                  var9.close();
+               } catch (Exception var10) {
+                  System.err.println("❌ Error processing chat request: " + var10.getMessage());
+                  ChatServer.sendError(var1, 500, "Internal Server Error: " + var10.getMessage());
+               }
+
+            }
+         }
+      }
+   }
+
+   private static class StatusHandler implements HttpHandler {
+      private StatusHandler() {
+      }
+
+      public void handle(HttpExchange var1) throws IOException {
+         if (!ChatServer.handlePreflight(var1)) {
+            ChatServer.setStandardHeaders(var1);
+            if (!"GET".equalsIgnoreCase(var1.getRequestMethod())) {
+               ChatServer.sendError(var1, 405, "Method Not Allowed. Use GET.");
+            } else {
+               String var2 = String.format("{\"status\":\"online\",\"trainedInstances\":%d,\"vocabularySize\":%d}", ChatServer.classifier.getTrainingSize(), ChatServer.classifier.getVocabulary().size());
+               byte[] var3 = var2.getBytes(StandardCharsets.UTF_8);
+               var1.sendResponseHeaders(200, (long)var3.length);
+               OutputStream var4 = var1.getResponseBody();
+               var4.write(var3);
+               var4.close();
+            }
+         }
+      }
+   }
+
+   private static class TrainHandler implements HttpHandler {
+      private TrainHandler() {
+      }
+
+      public void handle(HttpExchange var1) throws IOException {
+         if (!ChatServer.handlePreflight(var1)) {
+            ChatServer.setStandardHeaders(var1);
+            if (!"GET".equalsIgnoreCase(var1.getRequestMethod())) {
+               ChatServer.sendError(var1, 405, "Method Not Allowed. Use GET.");
+            } else {
+               try {
+                  ChatServer.classifier.train();
+                  String var2 = String.format("{\"status\":\"success\",\"message\":\"Classifier successfully re-trained.\",\"trainedInstances\":%d,\"vocabularySize\":%d}", ChatServer.classifier.getTrainingSize(), ChatServer.classifier.getVocabulary().size());
+                  byte[] var3 = var2.getBytes(StandardCharsets.UTF_8);
+                  var1.sendResponseHeaders(200, (long)var3.length);
+                  OutputStream var4 = var1.getResponseBody();
+                  var4.write(var3);
+                  var4.close();
+               } catch (Exception var5) {
+                  ChatServer.sendError(var1, 500, "Failed to re-train: " + var5.getMessage());
+               }
+
+            }
+         }
+      }
+   }
+}
