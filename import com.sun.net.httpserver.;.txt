@@ -1,0 +1,1042 @@
+import com.sun.net.httpserver.*;
+import java.io.*;
+import java.net.*;
+import java.nio.charset.*;
+import java.util.*;
+import java.util.regex.*;
+public class ChatServer {
+    private static final int PORT = 8080;
+    private static NLPClassifier classifier;
+    private static ResponseDatabase db;
+    public static void main(String[] args) {
+        try {
+            System.out.println("🤖 Initializing Omkar Vivah Chatbot Backend...");
+            db = new ResponseDatabase();
+            classifier = new NLPClassifier();
+            
+            System.out.println("📖 Loading training database...");
+            db.populateTrainingData(classifier);
+            
+            System.out.println("🧠 Training NLP Cosine-Similarity classifier...");
+            classifier.train();
+            System.out.printf("   - Trained on %d phrases\n", classifier.getTrainingSize());
+            System.out.printf("   - Vocabulary size: %d words\n", classifier.getVocabulary().size());
+            HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
+            
+            // Endpoint paths
+            server.createContext("/api/chat", new ChatHandler());
+            server.createContext("/api/status", new StatusHandler());
+            server.createContext("/api/train", new TrainHandler());
+            server.setExecutor(null); // default executor
+            server.start();
+            
+            System.out.println("🚀 ChatServer is running!");
+            System.out.println("🔌 API Endpoint: http://localhost:" + PORT + "/api/chat");
+            System.out.println("🔌 Status Endpoint: http://localhost:" + PORT + "/api/status");
+            System.out.println("💡 Press Ctrl+C to terminate the server.");
+        } catch (Exception e) {
+            System.err.println("❌ Failed to start ChatServer: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    /**
+     * Helper to set standard headers (CORS & JSON Content-Type).
+     */
+    private static void setStandardHeaders(HttpExchange exchange) {
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    }
+    /**
+     * Handles CORS Pre-flight requests. Returns true if request is OPTIONS.
+     */
+    private static boolean handlePreflight(HttpExchange exchange) throws IOException {
+        if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+            setStandardHeaders(exchange);
+            exchange.sendResponseHeaders(204, -1); // No Content
+            return true;
+        }
+        return false;
+    }
+    /**
+     * Handler for /api/chat POST requests.
+     */
+    private static class ChatHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (handlePreflight(exchange)) return;
+            setStandardHeaders(exchange);
+            
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendError(exchange, 405, "Method Not Allowed. Use POST.");
+                return;
+            }
+            try {
+                // Read request body
+                InputStream is = exchange.getRequestBody();
+                String body = readStream(is);
+                
+                // Parse message from json manually to avoid external dependencies
+                String userMessage = parseMessageFromJson(body);
+                if (userMessage.isEmpty()) {
+                    sendError(exchange, 400, "Bad Request: JSON body must contain a non-empty 'message' field.");
+                    return;
+                }
+                System.out.println("📥 Received query: \"" + userMessage + "\"");
+                // Classify intent
+                NLPClassifier.ClassificationResult result = classifier.classify(userMessage);
+                
+                // Generate response
+                String botResponse = db.getResponse(result.intent, userMessage);
+                System.out.println("📤 Matched intent: [" + result.intent + "] (Conf: " + String.format("%.2f", result.confidence) + ")");
+                // Build response JSON string
+                String responseJson = String.format(
+                    "{\"response\":\"%s\",\"intent\":\"%s\",\"confidence\":%.4f}",
+                    escapeJsonString(botResponse),
+                    result.intent,
+                    result.confidence
+                );
+                byte[] responseBytes = responseJson.getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, responseBytes.length);
+                OutputStream os = exchange.getResponseBody();
+                os.write(responseBytes);
+                os.close();
+            } catch (Exception e) {
+                System.err.println("❌ Error processing chat request: " + e.getMessage());
+                sendError(exchange, 500, "Internal Server Error: " + e.getMessage());
+            }
+        }
+    }
+    /**
+     * Handler for /api/status GET requests.
+     */
+    private static class StatusHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (handlePreflight(exchange)) return;
+            setStandardHeaders(exchange);
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendError(exchange, 405, "Method Not Allowed. Use GET.");
+                return;
+            }
+            String responseJson = String.format(
+                "{\"status\":\"online\",\"trainedInstances\":%d,\"vocabularySize\":%d}",
+                classifier.getTrainingSize(),
+                classifier.getVocabulary().size()
+            );
+            byte[] responseBytes = responseJson.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, responseBytes.length);
+            OutputStream os = exchange.getResponseBody();
+            os.write(responseBytes);
+            os.close();
+        }
+    }
+    /**
+     * Handler for /api/train GET requests (forces classifier re-training).
+     */
+    private static class TrainHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (handlePreflight(exchange)) return;
+            setStandardHeaders(exchange);
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendError(exchange, 405, "Method Not Allowed. Use GET.");
+                return;
+            }
+            try {
+                classifier.train();
+                String responseJson = String.format(
+                    "{\"status\":\"success\",\"message\":\"Classifier successfully re-trained.\",\"trainedInstances\":%d,\"vocabularySize\":%d}",
+                    classifier.getTrainingSize(),
+                    classifier.getVocabulary().size()
+                );
+                byte[] responseBytes = responseJson.getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, responseBytes.length);
+                OutputStream os = exchange.getResponseBody();
+                os.write(responseBytes);
+                os.close();
+            } catch (Exception e) {
+                sendError(exchange, 500, "Failed to re-train: " + e.getMessage());
+            }
+        }
+    }
+    // Helper functions
+    private static String readStream(InputStream is) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+        }
+        return sb.toString();
+    }
+    private static String parseMessageFromJson(String json) {
+        if (json == null || json.isEmpty()) return "";
+        // Match "message" : "value"
+        Pattern pattern = Pattern.compile("\"message\"\\s*:\\s*\"([^\"]+)\"");
+        Matcher matcher = pattern.matcher(json);
+        if (matcher.find()) {
+            return decodeJsonString(matcher.group(1));
+        }
+        return "";
+    }
+    private static String decodeJsonString(String str) {
+        return str.replace("\\\"", "\"")
+                  .replace("\\n", "\n")
+                  .replace("\\t", "\t")
+                  .replace("\\\\", "\\");
+    }
+    private static String escapeJsonString(String str) {
+        if (str == null) return "";
+        return str.replace("\\", "\\\\")
+                  .replace("\"", "\\\"")
+                  .replace("\n", "\\n")
+                  .replace("\r", "\\r")
+                  .replace("\t", "\\t");
+    }
+    private static void sendError(HttpExchange exchange, int statusCode, String message) throws IOException {
+        String errorJson = String.format("{\"error\":\"%s\"}", escapeJsonString(message));
+        byte[] responseBytes = errorJson.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(statusCode, responseBytes.length);
+        OutputStream os = exchange.getResponseBody();
+        os.write(responseBytes);
+        os.close();
+    }
+}
+import javax.swing.*;
+import javax.swing.text.html.HTMLDocument;
+import javax.swing.text.html.HTMLEditorKit;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
+public class ChatWindow extends JFrame {
+    private JTextPane chatLog;
+    private JTextField inputField;
+    private JButton sendButton;
+    private JButton clearButton;
+    
+    private NLPClassifier classifier;
+    private ResponseDatabase db;
+    private StringBuilder chatHistoryHtml;
+    public ChatWindow() {
+        // Initialize NLP Engine
+        System.out.println("🤖 Starting Desktop NLP Engine...");
+        db = new ResponseDatabase();
+        classifier = new NLPClassifier();
+        db.populateTrainingData(classifier);
+        classifier.train();
+        
+        chatHistoryHtml = new StringBuilder();
+        
+        // Setup Window Layout
+        setTitle("Omkar Vivah - AI Catering Assistant");
+        setSize(450, 600);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setLocationRelativeTo(null); // Center window
+        
+        // Create components
+        initUI();
+        
+        // Send initial greeting
+        appendBotMessage("Namaste! 🙏 I am your Omkar Vivah Catering Assistant. How can I help you customize your wedding menu or estimate a catering budget today?");
+    }
+    private void initUI() {
+        // Main Container
+        JPanel mainPanel = new JPanel(new BorderLayout(10, 10));
+        mainPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        mainPanel.setBackground(new Color(253, 251, 247)); // Soft Cream
+        // 1. Header Panel
+        JPanel headerPanel = new JPanel(new BorderLayout());
+        headerPanel.setBackground(new Color(223, 88, 45)); // Saffron
+        headerPanel.setBorder(BorderFactory.createEmptyBorder(12, 15, 12, 15));
+        
+        JLabel titleLabel = new JLabel("Omkar Vivah Assistant");
+        titleLabel.setFont(new Font("Serif", Font.BOLD, 18));
+        titleLabel.setForeground(Color.WHITE);
+        
+        JLabel subLabel = new JLabel("Online • Native Desktop AI");
+        subLabel.setFont(new Font("SansSerif", Font.PLAIN, 11));
+        subLabel.setForeground(new Color(253, 220, 208)); // Pale saffron
+        
+        JPanel titleTextPanel = new JPanel(new GridLayout(2, 1));
+        titleTextPanel.setOpaque(false);
+        titleTextPanel.add(titleLabel);
+        titleTextPanel.add(subLabel);
+        
+        headerPanel.add(titleTextPanel, BorderLayout.CENTER);
+        
+        // Avatar icon label
+        JLabel avatarLabel = new JLabel("👩‍💼 ");
+        avatarLabel.setFont(new Font("SansSerif", Font.PLAIN, 28));
+        headerPanel.add(avatarLabel, BorderLayout.WEST);
+        // 2. Chat Log Area (HTML Supported Pane)
+        chatLog = new JTextPane();
+        chatLog.setEditable(false);
+        chatLog.setContentType("text/html");
+        
+        // Setup HTMLEditorKit for styling
+        HTMLEditorKit kit = new HTMLEditorKit();
+        chatLog.setEditorKit(kit);
+        HTMLDocument doc = (HTMLDocument) chatLog.getDocument();
+        
+        // Add styling rules for bubbles
+        String styleSheet = "body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; background-color: #fdfbf7; margin: 10px; }" +
+                            ".msg-row-user { text-align: right; margin-bottom: 12px; }" +
+                            ".msg-row-bot { text-align: left; margin-bottom: 12px; }" +
+                            ".msg-bubble-user { display: inline-block; text-align: left; background: #df582d; color: white; padding: 8px 12px; border-radius: 12px; border-top-right-radius: 2px; max-width: 75%; }" +
+                            ".msg-bubble-bot { display: inline-block; text-align: left; background: white; color: #2a2e35; border: 1px solid #dfc28d; padding: 8px 12px; border-radius: 12px; border-top-left-radius: 2px; max-width: 75%; }" +
+                            "strong { color: #b08b43; font-weight: bold; }" +
+                            "ul { margin-top: 5px; margin-bottom: 5px; padding-left: 18px; }" +
+                            "li { margin-bottom: 3px; }";
+        kit.getStyleSheet().addRule(styleSheet);
+        JScrollPane scrollPane = new JScrollPane(chatLog);
+        scrollPane.setBorder(BorderFactory.createLineBorder(new Color(197, 160, 89, 80), 1));
+        scrollPane.getVerticalScrollBar().setUnitIncrement(16);
+        // 3. Input Form Panel
+        JPanel inputPanel = new JPanel(new BorderLayout(5, 5));
+        inputPanel.setOpaque(false);
+        
+        inputField = new JTextField();
+        inputField.setFont(new Font("SansSerif", Font.PLAIN, 13));
+        inputField.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(new Color(197, 160, 89, 120), 1, true),
+            BorderFactory.createEmptyBorder(8, 12, 8, 12)
+        ));
+        
+        // Send and Clear buttons
+        sendButton = new JButton("Send");
+        sendButton.setBackground(new Color(223, 88, 45));
+        sendButton.setForeground(Color.WHITE);
+        sendButton.setFocusPainted(false);
+        sendButton.setFont(new Font("SansSerif", Font.BOLD, 12));
+        sendButton.setBorder(BorderFactory.createEmptyBorder(8, 16, 8, 16));
+        
+        clearButton = new JButton("Clear");
+        clearButton.setBackground(new Color(246, 243, 235));
+        clearButton.setForeground(new Color(176, 139, 67));
+        clearButton.setFocusPainted(false);
+        clearButton.setFont(new Font("SansSerif", Font.BOLD, 12));
+        clearButton.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+        
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        buttonPanel.setOpaque(false);
+        buttonPanel.add(clearButton);
+        buttonPanel.add(sendButton);
+        
+        inputPanel.add(inputField, BorderLayout.CENTER);
+        inputPanel.add(buttonPanel, BorderLayout.EAST);
+        // Assemble Main Layout
+        mainPanel.add(headerPanel, BorderLayout.NORTH);
+        mainPanel.add(scrollPane, BorderLayout.CENTER);
+        mainPanel.add(inputPanel, BorderLayout.SOUTH);
+        
+        add(mainPanel);
+        // Attach Listeners
+        sendButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                submitMessage();
+            }
+        });
+        inputField.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.VK_ENTER) {
+                    submitMessage();
+                }
+            }
+        });
+        
+        clearButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                chatHistoryHtml.setLength(0);
+                chatLog.setText("");
+                appendBotMessage("Chat history cleared. How can I help you plan your catering event today?");
+            }
+        });
+    }
+    private void submitMessage() {
+        String userText = inputField.getText().trim();
+        if (userText.isEmpty()) return;
+        
+        // Render user message in GUI
+        appendUserMessage(userText);
+        inputField.setText("");
+        
+        // Perform local NLP classification
+        NLPClassifier.ClassificationResult result = classifier.classify(userText);
+        String botResponse = db.getResponse(result.intent, userText);
+        
+        // Render response
+        appendBotMessage(botResponse);
+    }
+    private void appendUserMessage(String message) {
+        String escaped = escapeHtml(message);
+        chatHistoryHtml.append("<div class='msg-row-user'><div class='msg-bubble-user'>")
+                      .append(escaped)
+                      .append("</div></div>");
+        refreshChatLog();
+    }
+    private void appendBotMessage(String message) {
+        String formatted = formatMarkdownToHtml(message);
+        chatHistoryHtml.append("<div class='msg-row-bot'><div class='msg-bubble-bot'>")
+                      .append(formatted)
+                      .append("</div></div>");
+        refreshChatLog();
+    }
+    private void refreshChatLog() {
+        chatLog.setText("<html><body>" + chatHistoryHtml.toString() + "</body></html>");
+        
+        // Auto-scroll scrollpane to bottom
+        SwingUtilities.invokeLater(() -> {
+            chatLog.setCaretPosition(chatLog.getDocument().getLength());
+        });
+    }
+    private String escapeHtml(String s) {
+        return s.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;");
+    }
+    private String formatMarkdownToHtml(String text) {
+        if (text == null) return "";
+        // Convert Markdown formatting (bolding, lists, breaks) to HTML tags for Swing rendering
+        String html = text
+            .replace("\n", "<br>")
+            .replaceAll("\\*\\*(.*?)\\*\\*", "<strong>$1</strong>") // **bold**
+            .replaceAll("•\\s+(.*?)(<br>|$)", "<li>$1</li>") // bullet lists
+            .replaceAll("✔\\s+(.*?)(<br>|$)", "<li>✅ $1</li>"); // inclusion checks
+        
+        if (html.contains("<li>")) {
+            // Group bullet points inside simple list tags
+            html = html.replace("<li>", "<ul><li>").replace("</li><br>", "</li>").replace("</li>", "</li></ul>");
+            // Fix double list nests
+            html = html.replace("</ul><ul>", "");
+        }
+        return html;
+    }
+    public static void main(String[] args) {
+        // Adjust Swing Theme
+        try {
+            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+        } catch (Exception ignored) {}
+        SwingUtilities.invokeLater(() -> {
+            new ChatWindow().setVisible(true);
+        });
+    }
+}
+import java.util.*;
+import java.util.regex.*;
+public class NLPClassifier {
+    // Set of common English stop words to filter out noisy terms
+    private static final Set<String> STOP_WORDS = new HashSet<>(Arrays.asList(
+        "a", "an", "the", "and", "or", "but", "if", "then", "else", "to", "for", "in", "on", 
+        "at", "by", "of", "with", "is", "are", "was", "were", "be", "been", "being", "this", 
+        "that", "these", "those", "it", "its", "i", "you", "he", "she", "they", "we", "me", 
+        "him", "her", "them", "us", "about", "your", "my", "our", "do", "does", "did", "have",
+        "has", "had", "can", "will", "would", "should", "could", "please"
+    ));
+    // Training set structure: Intent name -> list of training phrases
+    private final Map<String, List<String>> trainingData = new HashMap<>();
+    
+    // Flattened list of training instances for similarity matching: {Intent, Preprocessed Tokens}
+    private final List<TrainingInstance> instances = new ArrayList<>();
+    
+    // Vocabulary of unique terms across all training data
+    private final List<String> vocabulary = new ArrayList<>();
+    private final Map<String, Integer> termToIndex = new HashMap<>();
+    
+    // Document Frequency: how many training instances contain each term
+    private final Map<String, Integer> docFrequencies = new HashMap<>();
+    
+    // Inverse Document Frequency for each term in the vocabulary
+    private final Map<String, Double> idfs = new HashMap<>();
+    
+    // Pre-calculated TF-IDF vectors for all training instances
+    private final List<double[]> instanceVectors = new ArrayList<>();
+    private static class TrainingInstance {
+        String intent;
+        String rawText;
+        List<String> tokens;
+        TrainingInstance(String intent, String rawText, List<String> tokens) {
+            this.intent = intent;
+            this.rawText = rawText;
+            this.tokens = tokens;
+        }
+    }
+    public NLPClassifier() {
+        // Training data is loaded from the ResponseDatabase
+    }
+    /**
+     * Registers a training phrase for an intent.
+     */
+    public void addTrainingPhrase(String intent, String phrase) {
+        trainingData.computeIfAbsent(intent, k -> new ArrayList<>()).add(phrase);
+    }
+    /**
+     * Builds the TF-IDF vector space model after all training phrases are registered.
+     */
+    public void train() {
+        instances.clear();
+        vocabulary.clear();
+        termToIndex.clear();
+        docFrequencies.clear();
+        idfs.clear();
+        instanceVectors.clear();
+        // 1. Preprocess all training examples
+        for (Map.Entry<String, List<String>> entry : trainingData.entrySet()) {
+            String intent = entry.getKey();
+            for (String phrase : entry.getValue()) {
+                List<String> tokens = preprocess(phrase);
+                if (tokens.isEmpty()) continue;
+                instances.add(new TrainingInstance(intent, phrase, tokens));
+            }
+        }
+        // 2. Build vocabulary and compute document frequencies
+        for (TrainingInstance inst : instances) {
+            Set<String> uniqueTerms = new HashSet<>(inst.tokens);
+            for (String term : uniqueTerms) {
+                // Add to vocabulary
+                if (!termToIndex.containsKey(term)) {
+                    termToIndex.put(term, vocabulary.size());
+                    vocabulary.add(term);
+                }
+                // Update doc frequency
+                docFrequencies.put(term, docFrequencies.getOrDefault(term, 0) + 1);
+            }
+        }
+        // 3. Compute IDF for all terms: log(1.0 + Total Docs / Doc Freq)
+        double totalDocs = instances.size();
+        for (String term : vocabulary) {
+            double df = docFrequencies.get(term);
+            double idf = Math.log(1.0 + (totalDocs / df));
+            idfs.put(term, idf);
+        }
+        // 4. Build TF-IDF vectors for training instances
+        for (TrainingInstance inst : instances) {
+            double[] vector = calculateTfidfVector(inst.tokens);
+            instanceVectors.add(vector);
+        }
+    }
+    /**
+     * Classifies a user query and returns the matched intent and similarity score.
+     */
+    public ClassificationResult classify(String query) {
+        List<String> queryTokens = preprocess(query);
+        if (queryTokens.isEmpty() || instances.isEmpty()) {
+            return new ClassificationResult("unknown", 0.0);
+        }
+        double[] queryVector = calculateTfidfVector(queryTokens);
+        
+        String bestIntent = "unknown";
+        double maxSimilarity = 0.0;
+        String bestMatchPhrase = "";
+        // Compare query vector with each training instance vector using Cosine Similarity
+        for (int i = 0; i < instances.size(); i++) {
+            double[] instVector = instanceVectors.get(i);
+            double similarity = cosineSimilarity(queryVector, instVector);
+            
+            if (similarity > maxSimilarity) {
+                maxSimilarity = similarity;
+                bestIntent = instances.get(i).intent;
+                bestMatchPhrase = instances.get(i).rawText;
+            }
+        }
+        // Apply a classification threshold to avoid low-confidence matches
+        double threshold = 0.12; 
+        if (maxSimilarity < threshold) {
+            return new ClassificationResult("unknown", maxSimilarity, bestMatchPhrase);
+        }
+        return new ClassificationResult(bestIntent, maxSimilarity, bestMatchPhrase);
+    }
+    /**
+     * Clean, tokenize, remove stop-words, and apply lightweight stemmer.
+     */
+    public List<String> preprocess(String text) {
+        if (text == null) return Collections.emptyList();
+        // 1. Lowercase
+        String cleaned = text.toLowerCase().trim();
+        // 2. Tokenize by matching word patterns (strip punctuation)
+        Pattern wordPattern = Pattern.compile("[a-zA-Z0-9]+");
+        Matcher matcher = wordPattern.matcher(cleaned);
+        List<String> rawTokens = new ArrayList<>();
+        while (matcher.find()) {
+            rawTokens.add(matcher.group());
+        }
+        // 3. Remove stop-words and apply simple stemming rules
+        List<String> processedTokens = new ArrayList<>();
+        for (String token : rawTokens) {
+            if (STOP_WORDS.contains(token) && token.length() > 2) continue; // Keep small words like 'no' or 'veg'
+            
+            String stemmed = stem(token);
+            if (stemmed.length() > 1) {
+                processedTokens.add(stemmed);
+            }
+        }
+        return processedTokens;
+    }
+    /**
+     * Simple suffix stemming rules for catering vocabulary.
+     */
+    private String stem(String word) {
+        if (word.length() <= 3) return word;
+        // Plurals
+        if (word.endsWith("es") && !word.endsWith("ees")) {
+            word = word.substring(0, word.length() - 2);
+        } else if (word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us")) {
+            word = word.substring(0, word.length() - 1);
+        }
+        // Common verbal suffixes
+        if (word.endsWith("ing")) {
+            word = word.substring(0, word.length() - 3);
+        } else if (word.endsWith("ed")) {
+            word = word.substring(0, word.length() - 2);
+        }
+        // Catering specific normalizations
+        if (word.equals("pricing") || word.equals("price") || word.equals("costing") || word.equals("cost")) {
+            return "price";
+        }
+        if (word.equals("booking") || word.equals("book") || word.equals("reserve")) {
+            return "book";
+        }
+        if (word.equals("catering") || word.equals("caterer") || word.equals("cater")) {
+            return "cater";
+        }
+        if (word.equals("menus") || word.equals("menu")) {
+            return "menu";
+        }
+        if (word.equals("plate") || word.equals("plates") || word.equals("dish") || word.equals("dishes")) {
+            return "plate";
+        }
+        return word;
+    }
+    /**
+     * Computes TF-IDF vector for a list of tokens.
+     */
+    private double[] calculateTfidfVector(List<String> tokens) {
+        double[] vector = new double[vocabulary.size()];
+        if (tokens.isEmpty()) return vector;
+        // Count term frequency in current doc
+        Map<String, Integer> tfMap = new HashMap<>();
+        for (String token : tokens) {
+            tfMap.put(token, tfMap.getOrDefault(token, 0) + 1);
+        }
+        // Calculate TF-IDF: (Term Count / Total Words) * IDF
+        double docSize = tokens.size();
+        for (Map.Entry<String, Integer> entry : tfMap.entrySet()) {
+            String term = entry.getKey();
+            Integer index = termToIndex.get(term);
+            if (index != null) {
+                double tf = entry.getValue() / docSize;
+                double idf = idfs.getOrDefault(term, 0.0);
+                vector[index] = tf * idf;
+            }
+        }
+        return vector;
+    }
+    /**
+     * Calculates cosine similarity between two double arrays.
+     */
+    private double cosineSimilarity(double[] v1, double[] v2) {
+        double dotProduct = 0.0;
+        double normA = 0.0;
+        double normB = 0.0;
+        for (int i = 0; i < v1.length; i++) {
+            dotProduct += v1[i] * v2[i];
+            normA += Math.pow(v1[i], 2);
+            normB += Math.pow(v2[i], 2);
+        }
+        if (normA == 0.0 || normB == 0.0) {
+            return 0.0;
+        }
+        return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+    }
+    public List<String> getVocabulary() {
+        return Collections.unmodifiableList(vocabulary);
+    }
+    public int getTrainingSize() {
+        return instances.size();
+    }
+    public static class ClassificationResult {
+        public final String intent;
+        public final double confidence;
+        public final String matchedPhrase;
+        public ClassificationResult(String intent, double confidence) {
+            this(intent, confidence, "");
+        }
+        public ClassificationResult(String intent, double confidence, String matchedPhrase) {
+            this.intent = intent;
+            this.confidence = confidence;
+            this.matchedPhrase = matchedPhrase;
+        }
+        @Override
+        public String toString() {
+            return String.format("Result[intent=%s, conf=%.2f, match='%s']", intent, confidence, matchedPhrase);
+        }
+    }
+}
+import java.util.*;
+import java.util.regex.*;
+public class ResponseDatabase {
+    public static class PackageInfo {
+        public final String event;
+        public final String tier;
+        public final int vegPrice;
+        public final int nonVegPrice; // -1 if not available
+        public final int minGuests;
+        public PackageInfo(String event, String tier, int vegPrice, int nonVegPrice, int minGuests) {
+            this.event = event;
+            this.tier = tier;
+            this.vegPrice = vegPrice;
+            this.nonVegPrice = nonVegPrice;
+            this.minGuests = minGuests;
+        }
+        public String getFullName() {
+            return event.substring(0, 1).toUpperCase() + event.substring(1) + " " + tier;
+        }
+    }
+    private final List<PackageInfo> packages = new ArrayList<>();
+    private final Map<String, List<String>> responses = new HashMap<>();
+    public ResponseDatabase() {
+        initPackages();
+        initResponses();
+    }
+    private void initPackages() {
+        // Haldi & Muhurt
+        packages.add(new PackageInfo("haldi", "Essential", 80, -1, 50));
+        packages.add(new PackageInfo("haldi", "Premium", 120, 160, 75));
+        packages.add(new PackageInfo("haldi", "Royal", 150, 200, 100));
+        // Sangeet & Mehendi
+        packages.add(new PackageInfo("sangeet", "Essential", 120, 180, 100));
+        packages.add(new PackageInfo("sangeet", "Premium", 160, 220, 150));
+        packages.add(new PackageInfo("sangeet", "Royal", 200, 280, 200));
+        // Engagement / Roka
+        packages.add(new PackageInfo("engagement", "Essential", 100, 160, 50));
+        packages.add(new PackageInfo("engagement", "Premium", 140, 200, 75));
+        packages.add(new PackageInfo("engagement", "Royal", 180, 250, 100));
+        // Wedding / Pheras
+        packages.add(new PackageInfo("wedding", "Essential", 100, 200, 150));
+        packages.add(new PackageInfo("wedding", "Premium", 150, 250, 200));
+        packages.add(new PackageInfo("wedding", "Royal", 200, 350, 300));
+        // Reception
+        packages.add(new PackageInfo("reception", "Essential", 150, 250, 200));
+        packages.add(new PackageInfo("reception", "Premium", 200, 300, 300));
+        packages.add(new PackageInfo("reception", "Royal", 280, 400, 500));
+        // Vidai
+        packages.add(new PackageInfo("vidai", "Essential", 90, 140, 30));
+        packages.add(new PackageInfo("vidai", "Premium", 120, 180, 50));
+        packages.add(new PackageInfo("vidai", "Royal", 150, 220, 75));
+        // Anniversary
+        packages.add(new PackageInfo("anniversary", "Essential", 120, 200, 50));
+        packages.add(new PackageInfo("anniversary", "Premium", 180, 280, 75));
+        packages.add(new PackageInfo("anniversary", "Royal", 250, 380, 100));
+        // Destination
+        packages.add(new PackageInfo("destination", "Essential", 180, 280, 100));
+        packages.add(new PackageInfo("destination", "Premium", 250, 380, 150));
+        packages.add(new PackageInfo("destination", "Royal", 350, 500, 200));
+    }
+    private void initResponses() {
+        responses.put("greeting", Arrays.asList(
+            "Namaste! 🙏 Welcome to Omkar Vivah Caterers. I'm your wedding catering assistant. How can I help you plan your special feast today?",
+            "Hello! Warm greetings from Omkar Vivah. How can I assist you with your wedding or event menu planning today? 😊",
+            "Namaste! Glad to connect with you. I can assist you with event packages, pricing, customized quotes, or scheduling a tasting session!"
+        ));
+        responses.put("goodbye", Arrays.asList(
+            "Thank you for chatting! We hope to make your wedding feast truly royal. Have a wonderful day ahead! 🌸",
+            "Goodbye! Please feel free to reach out again or complete the booking form below to secure your date. Namaste! 🙏",
+            "Thank you! If you need anything else, just drop a message. Looking forward to serving your wedding guests!"
+        ));
+        responses.put("help", Arrays.asList(
+            "I can help you with:\n\n• **Packages & Pricing**: Ask about Haldi, Sangeet, Engagement, Wedding, or Reception packages.\n• **Instant Catering Quotes**: Try asking *'estimate for 250 guests Sangeet Premium'*.\n• **Dietary Information**: Ask about Veg/Non-Veg options and purity standards.\n• **Booking/Tastings**: Find out how to book a free food tasting session."
+        ));
+        responses.put("packages", Arrays.asList(
+            "We offer customized catering packages for 8 event types:\n\n" +
+            "1. **Haldi & Muhurt**: ₹80 to ₹150 per plate (Veg/Non-Veg)\n" +
+            "2. **Sangeet & Mehendi**: ₹120 to ₹280 per plate\n" +
+            "3. **Engagement / Roka**: ₹100 to ₹250 per plate\n" +
+            "4. **Wedding / Pheras**: ₹100 to ₹350 per plate\n" +
+            "5. **Reception Banquet**: ₹150 to ₹400 per plate\n" +
+            "6. **Vidai**: ₹90 to ₹220 per plate\n" +
+            "7. **Anniversary**: ₹120 to ₹380 per plate\n" +
+            "8. **Destination Wedding**: ₹180 to ₹500 per plate\n\n" +
+            "Which event package are you planning for? You can ask details about any specific package (e.g. *'Tell me about Sangeet Premium'*)."
+        ));
+        responses.put("booking_info", Arrays.asList(
+            "Booking a catering package with Omkar Vivah is simple:\n" +
+            "1. **Schedule a Tasting**: Click the 'Book Wedding Tasting' button above to select your menu options.\n" +
+            "2. **Quote & Finalization**: We'll review your guest count, customize the dishes, and finalize the date.\n" +
+            "3. **Secure Date**: Pay a 25% booking advance to secure our services for your wedding date.\n\n" +
+            "Would you like to visit our office in Pune, or shall I guide you to submit an inquiry right here?",
+            "To book us for your wedding, scroll down to our 'Book Us' form, fill in your details, and submit! Our wedding coordinator will call you back within 2 hours to set up a free tasting session."
+        ));
+        responses.put("veg_nonveg", Arrays.asList(
+            "🌿 **100% Purity and Separation**: At Omkar Vivah, we maintain absolute hygiene and segregation. We use entirely separate kitchens, utensils, and service staff for Vegetarian and Non-Vegetarian food preparations.\n\n" +
+            "We serve classic Maharashtrian vegetarian feasts, royal North Indian menus, Mughlai non-veg specials, mocktail bars, live chaat, and international food counters.",
+            "Yes, we provide both Vegetarian and Non-Vegetarian menus! We operate dedicated, separate preparation lines to maintain the highest purity and respect dietary preferences."
+        ));
+        responses.put("min_guests", Arrays.asList(
+            "Our minimum guest count varies by package, ranging from **30 guests** for Vidai packages, **50 guests** for Haldi/Engagement, to **150-300 guests** for Sangeet, Wedding, and Reception events. \n\nWhat is your expected guest list size? I can recommend packages that suit your event!"
+        ));
+        responses.put("location", Arrays.asList(
+            "📍 Omkar Vivah Caterers is proudly based in **Pune, Maharashtra**. We provide complete catering services all across Pune city, PCMC, and destination weddings throughout Maharashtra (like Lonavala, Mahabaleshwar, Alibaug, and Mulshi).",
+            "We are located in Pune, but our destination packages cover catering across the state of Maharashtra. We bring our full kitchen team and logistics straight to your wedding venue!"
+        ));
+        responses.put("about_us", Arrays.asList(
+            "✨ **Omkar Vivah Caterers** has been Pune's premier wedding and Shaadi caterer since 2006. We have successfully catered over **1,200+ weddings** and celebrations.\n\nWe are known for our authentic Maharashtrian wedding thalis, royal North Indian buffets, interactive live counters, and high-end 5-star hospitality."
+        ));
+    }
+    /**
+     * Feeds the NLPClassifier with training examples for each intent.
+     */
+    public void populateTrainingData(NLPClassifier classifier) {
+        // Greeting training phrases
+        classifier.addTrainingPhrase("greeting", "hi");
+        classifier.addTrainingPhrase("greeting", "hello");
+        classifier.addTrainingPhrase("greeting", "namaste");
+        classifier.addTrainingPhrase("greeting", "hey there");
+        classifier.addTrainingPhrase("greeting", "anyone there");
+        classifier.addTrainingPhrase("greeting", "good morning");
+        classifier.addTrainingPhrase("greeting", "good afternoon");
+        // Goodbye training phrases
+        classifier.addTrainingPhrase("goodbye", "bye");
+        classifier.addTrainingPhrase("goodbye", "goodbye");
+        classifier.addTrainingPhrase("goodbye", "see you later");
+        classifier.addTrainingPhrase("goodbye", "thanks bye");
+        classifier.addTrainingPhrase("goodbye", "no more questions");
+        // Help training phrases
+        classifier.addTrainingPhrase("help", "help");
+        classifier.addTrainingPhrase("help", "what can you do");
+        classifier.addTrainingPhrase("help", "how does this work");
+        classifier.addTrainingPhrase("help", "info");
+        classifier.addTrainingPhrase("help", "list options");
+        classifier.addTrainingPhrase("help", "support");
+        // Packages training phrases
+        classifier.addTrainingPhrase("packages", "packages");
+        classifier.addTrainingPhrase("packages", "what events do you cater");
+        classifier.addTrainingPhrase("packages", "what are the menus");
+        classifier.addTrainingPhrase("packages", "pricing details");
+        classifier.addTrainingPhrase("packages", "show me packages");
+        classifier.addTrainingPhrase("packages", "menu plans");
+        classifier.addTrainingPhrase("packages", "list of packages");
+        // Booking info training phrases
+        classifier.addTrainingPhrase("booking_info", "how to book");
+        classifier.addTrainingPhrase("booking_info", "make a reservation");
+        classifier.addTrainingPhrase("booking_info", "tasting session");
+        classifier.addTrainingPhrase("booking_info", "booking advance");
+        classifier.addTrainingPhrase("booking_info", "i want to book you");
+        classifier.addTrainingPhrase("booking_info", "hire caterer");
+        classifier.addTrainingPhrase("booking_info", "schedule a call");
+        // Veg/Non-veg training phrases
+        classifier.addTrainingPhrase("veg_nonveg", "veg");
+        classifier.addTrainingPhrase("veg_nonveg", "non veg");
+        classifier.addTrainingPhrase("veg_nonveg", "vegetarian");
+        classifier.addTrainingPhrase("veg_nonveg", "do you serve chicken");
+        classifier.addTrainingPhrase("veg_nonveg", "separate kitchens");
+        classifier.addTrainingPhrase("veg_nonveg", "mutton fish");
+        classifier.addTrainingPhrase("veg_nonveg", "pure veg");
+        // Min guests training phrases
+        classifier.addTrainingPhrase("min_guests", "minimum guests");
+        classifier.addTrainingPhrase("min_guests", "how many plates minimum");
+        classifier.addTrainingPhrase("min_guests", "small wedding 50 guests");
+        classifier.addTrainingPhrase("min_guests", "guest limit");
+        classifier.addTrainingPhrase("min_guests", "min capacity");
+        // Location training phrases
+        classifier.addTrainingPhrase("location", "location");
+        classifier.addTrainingPhrase("location", "where are you based");
+        classifier.addTrainingPhrase("location", "address");
+        classifier.addTrainingPhrase("location", "pune caterers");
+        classifier.addTrainingPhrase("location", "do you travel to lonavala");
+        classifier.addTrainingPhrase("location", "office location");
+        // About us training phrases
+        classifier.addTrainingPhrase("about_us", "who are you");
+        classifier.addTrainingPhrase("about_us", "tell me about omkar vivah");
+        classifier.addTrainingPhrase("about_us", "since when catering");
+        classifier.addTrainingPhrase("about_us", "experience");
+        classifier.addTrainingPhrase("about_us", "number of weddings");
+        // Quote request training phrases
+        classifier.addTrainingPhrase("quote_request", "quote");
+        classifier.addTrainingPhrase("quote_request", "estimate");
+        classifier.addTrainingPhrase("quote_request", "price list");
+        classifier.addTrainingPhrase("quote_request", "how much for guests");
+        classifier.addTrainingPhrase("quote_request", "cost calculator");
+        classifier.addTrainingPhrase("quote_request", "calculate budget");
+        classifier.addTrainingPhrase("quote_request", "wedding cost for 200 plates");
+    }
+    /**
+     * Resolves the response for a matched intent, incorporating dynamic entity calculations if needed.
+     */
+    public String getResponse(String intent, String userMessage) {
+        // If the intent is quote_request, or we spot guest/package entities in general, calculate it!
+        if (intent.equals("quote_request") || containsQuoteEntities(userMessage)) {
+            return calculateCustomQuote(userMessage);
+        }
+        List<String> list = responses.get(intent);
+        if (list == null || list.isEmpty()) {
+            return "I'm sorry, I didn't quite catch that. Could you please rephrase or try asking about our event packages, veg/non-veg policy, or type 'help' for options?";
+        }
+        // Return a random response from the available list to make the conversation feel dynamic
+        int index = new Random().nextInt(list.size());
+        return list.get(index);
+    }
+    /**
+     * Returns true if user input contains guest counts or package keywords.
+     */
+    private boolean containsQuoteEntities(String msg) {
+        String lower = msg.toLowerCase();
+        boolean hasGuests = lower.matches(".*\\b\\d{2,4}\\b.*");
+        boolean hasPackageKeywords = lower.contains("estimate") || lower.contains("quote") || lower.contains("cost") || 
+                                     lower.contains("price") || lower.contains("how much") || lower.contains("plate");
+        return hasGuests && hasPackageKeywords;
+    }
+    /**
+     * Parses guest count and event package from query to calculate custom quote dynamically.
+     */
+    private String calculateCustomQuote(String msg) {
+        String lower = msg.toLowerCase();
+        // 1. Extract guest count (find 2 to 4 digit integers)
+        int guestCount = -1;
+        Pattern guestPattern = Pattern.compile("\\b(\\d{2,4})\\b");
+        Matcher matcher = guestPattern.matcher(msg);
+        if (matcher.find()) {
+            guestCount = Integer.parseInt(matcher.group(1));
+        }
+        if (guestCount == -1) {
+            return "I see you are asking for a quote. Please let me know **how many guests** you are expecting, and which **package** you prefer (e.g. *'Estimate for 200 guests Sangeet Premium'*).";
+        }
+        // 2. Identify the target event package
+        PackageInfo selectedPkg = null;
+        for (PackageInfo pkg : packages) {
+            String eventName = pkg.event;
+            String tierName = pkg.tier.toLowerCase();
+            
+            // Check if user text contains both the event name and the tier name
+            if (lower.contains(eventName) && lower.contains(tierName)) {
+                selectedPkg = pkg;
+                break;
+            }
+        }
+        // Fallback package search: check just event name, pick "Premium" as default
+        if (selectedPkg == null) {
+            for (PackageInfo pkg : packages) {
+                if (lower.contains(pkg.event) && pkg.tier.equalsIgnoreCase("Premium")) {
+                    selectedPkg = pkg;
+                    break;
+                }
+            }
+        }
+        // If still no event found, check for wedding keyword
+        if (selectedPkg == null && (lower.contains("wedding") || lower.contains("marriage") || lower.contains("shaadi"))) {
+            for (PackageInfo pkg : packages) {
+                if (pkg.event.equals("wedding") && pkg.tier.equalsIgnoreCase("Premium")) {
+                    selectedPkg = pkg;
+                    break;
+                }
+            }
+        }
+        if (selectedPkg == null) {
+            return String.format(
+                "I detected a guest count of **%d guests**, but I'm not sure which package you want to estimate. " +
+                "Could you specify the event? (e.g., *'Wedding Premium'*, *'Sangeet Royal'*, or *'Haldi Essential'*).\n\n" +
+                "Here are standard packages you can choose from:\n" +
+                "• **Wedding Premium**: ₹150 (Veg) / ₹250 (Non-Veg)\n" +
+                "• **Sangeet Royal**: ₹200 (Veg) / ₹280 (Non-Veg)\n" +
+                "• **Engagement Premium**: ₹140 (Veg) / ₹200 (Non-Veg)", 
+                guestCount
+            );
+        }
+        // 3. Compute Quotation
+        StringBuilder reply = new StringBuilder();
+        reply.append("📊 **Catering Budget Estimate (Omkar Vivah)**\n\n");
+        reply.append(String.format("• **Selected Package**: %s\n", selectedPkg.getFullName()));
+        reply.append(String.format("• **Guest Count**: %d guests\n", guestCount));
+        
+        // Check minimum guest constraint
+        if (guestCount < selectedPkg.minGuests) {
+            reply.append(String.format("⚠️ *Note: The minimum guests required for %s is %d. Your request (%d) is below this. We will apply rates for the minimum limit of %d guests if booked.*\n\n", 
+                selectedPkg.getFullName(), selectedPkg.minGuests, guestCount, selectedPkg.minGuests));
+        }
+        // Calculate pricing
+        int calculationGuests = Math.max(guestCount, selectedPkg.minGuests);
+        
+        // Veg calculations
+        int vegSubtotal = calculationGuests * selectedPkg.vegPrice;
+        int vegGst = (int)Math.round(vegSubtotal * 0.18);
+        int vegTotal = vegSubtotal + vegGst;
+        
+        reply.append(String.format("🌿 **Vegetarian Menu Quote**:\n"));
+        reply.append(String.format("  - Base Rate: ₹%d / plate\n", selectedPkg.vegPrice));
+        reply.append(String.format("  - Subtotal: ₹%,d\n", vegSubtotal));
+        reply.append(String.format("  - GST (18%%): ₹%,d\n", vegGst));
+        reply.append(String.format("  - **Total Cost**: **₹%,d**\n\n", vegTotal));
+        // Non-veg calculations (if available)
+        if (selectedPkg.nonVegPrice != -1) {
+            int nvSubtotal = calculationGuests * selectedPkg.nonVegPrice;
+            int nvGst = (int)Math.round(nvSubtotal * 0.18);
+            int nvTotal = nvSubtotal + nvGst;
+            reply.append(String.format("🍖 **Non-Vegetarian Menu Quote**:\n"));
+            reply.append(String.format("  - Base Rate: ₹%d / plate\n", selectedPkg.nonVegPrice));
+            reply.append(String.format("  - Subtotal: ₹%,d\n", nvSubtotal));
+            reply.append(String.format("  - GST (18%%): ₹%,d\n", nvGst));
+            reply.append(String.format("  - **Total Cost**: **₹%,d**\n\n", nvTotal));
+        } else {
+            reply.append("🍖 *Non-Vegetarian menu is not available for this specific breakfast package (Haldi Essential is Veg only).*\n\n");
+        }
+        reply.append("✨ **Includes**:\n");
+        if (selectedPkg.event.equals("wedding")) {
+            reply.append("  ✔ Buffet setup, service staff, chaffing dishes, premium cutlery, and welcome drinks.\n");
+        } else if (selectedPkg.event.equals("sangeet")) {
+            reply.append("  ✔ Live counters (chaat/tandoor), mocktail bar setup, and serving staff.\n");
+        } else {
+            reply.append("  ✔ Standard layout setup, service staff, and cleanup.\n");
+        }
+        reply.append("\nTo book a **free tasting session** or customize this menu, scroll down to fill out the form or tell me: *'How do I book?'*");
+        return reply.toString();
+    }
+}
+@echo off
+title Omkar Vivah Chatbot GUI
+echo ===================================================
+)
+echo 🛠️ Compiling Java files...
+javac -encoding UTF-8 -d bin src\main\java\com\caterer\chatbot\*.java
+javac -encoding UTF-8 -d bin *.java
+if %errorlevel% neq 0 (
+    echo.
+    echo ❌ Compilation FAILED!
+    pause
+    exit /b %errorlevel%
+)
+echo.
+echo ✅ Compilation successful!
+echo 🚀 Launching Desktop Chat Window...
+echo ---------------------------------------------------
+java -cp bin com.caterer.chatbot.ChatWindow
+java -cp bin ChatWindow
+echo ---------------------------------------------------
+echo.
+@echo off
+title Omkar Vivah Chatbot Server
+echo ===================================================
+)
+echo 🛠️ Compiling Java files...
+javac -d bin src\main\java\com\caterer\chatbot\*.java
+javac -d bin *.java
+if %errorlevel% neq 0 (
+    echo.
+    echo ❌ Compilation FAILED! Please check the Java syntax error messages above.
+    pause
+    exit /b %errorlevel%
+)
+echo.
+echo ✅ Compilation successful!
+echo 🚀 Launching server...
+echo ---------------------------------------------------
+java -cp bin com.caterer.chatbot.ChatServer
+java -cp bin ChatServer
+echo ---------------------------------------------------
+echo.
+pause
